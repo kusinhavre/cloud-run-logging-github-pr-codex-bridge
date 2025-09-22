@@ -49,10 +49,9 @@ Create the following repository **secrets** (`Settings → Secrets and variables
 ### Repository variables
 
 Add the following repository **variables** (`Settings → Secrets and variables → Actions → New repository variable`). They control comment formatting and log selection and can be tuned without touching secrets:
-
 | Variable | Purpose | Default idea |
 | --- | --- | --- |
-| `CODEX_HANDLE` | Handle to mention in PR comments | `codex` |
+| `CODEX_HANDLE` | Handle to mention in PR comments | `codex` 
 | `WINDOW_MIN` | Minutes before/after an incident to query logs | `5` |
 | `MAX_LINES` | Maximum total log lines captured | `40` |
 | `MAX_CHARS` | Maximum characters included in the comment | `20000` |
