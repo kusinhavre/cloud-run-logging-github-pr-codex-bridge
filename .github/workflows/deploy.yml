@@ -41,15 +41,22 @@ jobs:
           MAX_CHARS: ${{ vars.MAX_CHARS }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          # 1) Clear old env/secret mappings if the service already exists
+          if gcloud run services describe "$SERVICE_NAME" \
+               --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
+            gcloud run services update "$SERVICE_NAME" \
+              --project "$PROJECT_ID" --region "$REGION" \
+              --remove-env-vars WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
+              --remove-secrets  WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
+              --quiet
+          fi
+          
+          # 2) Deploy with ONLY set flags (no remove flags here)
           gcloud run deploy "$SERVICE_NAME" \
-            --project "$PROJECT_ID" \
-            --region "$REGION" \
+            --project "$PROJECT_ID" --region "$REGION" \
             --source . \
             --allow-unauthenticated \
-            --remove-env-vars WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
-            --remove-secrets  WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
             --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS" \
             --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest,WEBHOOK_USER=webhook-user:latest,WEBHOOK_PASS=webhook-pass:latest,GITHUB_TOKEN=github-token:latest \
             --quiet
-
         
