@@ -46,6 +46,6 @@ jobs:
             --region "$REGION" \
             --source . \
             --allow-unauthenticated \
-            --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS" \
-            --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest,WEBHOOK_USER=webhook-user:latest,WEBHOOK_PASS=webhook-pass:latest,GITHUB_TOKEN=github-token:latest \
+            --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS",WEBHOOK_USER="$BASIC_USER",WEBHOOK_PASS="$BASIC_PASS",GITHUB_TOKEN="$GH_TOKEN"  \
+            --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest\
             --quiet
