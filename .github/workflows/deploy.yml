@@ -44,18 +44,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gcloud config set project "${PROJECT_ID}"
-          cat <<EOF > env-vars.txt
-REGION=${REGION}
-CLOUD_RUN_SERVICES=${SERVICES}
-REPO_MAP_JSON=${REPO_MAP}
-CODEX_HANDLE=${CODEX_HANDLE}
-WINDOW_MIN=${WINDOW_MIN}
-MAX_LINES=${MAX_LINES}
-MAX_CHARS=${MAX_CHARS}
-WEBHOOK_USER=${BASIC_USER}
-WEBHOOK_PASS=${BASIC_PASS}
-GITHUB_TOKEN=${GH_TOKEN}
-EOF
+          printf '%s\n' \
+            "REGION=${REGION}" \
+            "CLOUD_RUN_SERVICES=${SERVICES}" \
+            "REPO_MAP_JSON=${REPO_MAP}" \
+            "CODEX_HANDLE=${CODEX_HANDLE}" \
+            "WINDOW_MIN=${WINDOW_MIN}" \
+            "MAX_LINES=${MAX_LINES}" \
+            "MAX_CHARS=${MAX_CHARS}" \
+            "WEBHOOK_USER=${BASIC_USER}" \
+            "WEBHOOK_PASS=${BASIC_PASS}" \
+            "GITHUB_TOKEN=${GH_TOKEN}" \
+            > env-vars.txt
           gcloud run deploy "$SERVICE_NAME" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
