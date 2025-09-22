@@ -42,15 +42,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gcloud run deploy "$SERVICE_NAME" \
-          --project "$PROJECT_ID" \
-          --region "$REGION" \
-          --source . \
-          --allow-unauthenticated \
-          # remove any stale mappings (literal or secret) for these keys
-          --remove-env-vars WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
-          --remove-secrets  WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --source . \
             --allow-unauthenticated \
-            --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS",WEBHOOK_USER="$BASIC_USER",WEBHOOK_PASS="$BASIC_PASS",GITHUB_TOKEN="$GH_TOKEN"  \
-            --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest\
+            --remove-env-vars WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
+            --remove-secrets  WEBHOOK_USER,WEBHOOK_PASS,GITHUB_TOKEN \
+            --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS" \
+            --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest,WEBHOOK_USER=webhook-user:latest,WEBHOOK_PASS=webhook-pass:latest,GITHUB_TOKEN=github-token:latest \
             --quiet
+
         
