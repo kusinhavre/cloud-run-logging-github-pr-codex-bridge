@@ -18,14 +18,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - id: auth
-        name: Authenticate to Google Cloud
+        
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          project_id: ${{ secrets.PROJECT_ID }}
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up gcloud SDK
@@ -34,15 +30,6 @@ jobs:
           project_id: ${{ secrets.PROJECT_ID }}
 
       - name: Deploy Cloud Run service
-        run: |
-          gcloud run deploy "$SERVICE_NAME" \
-            --project "${PROJECT_ID}" \
-            --region "${REGION}" \
-            --source . \
-            --allow-unauthenticated \
-            --set-env-vars REGION="${REGION}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",CODEX_HANDLE="${CODEX_HANDLE}",CLOUD_RUN_SERVICES="${SERVICES}",WEBHOOK_USER="${BASIC_USER}",WEBHOOK_PASS="${BASIC_PASS}",DEFAULT_REPO="${DEFAULT_REPO}",GITHUB_TOKEN="${GH_PR_TOKEN}" \
-            --set-env-vars "REPO_MAP_JSON=${REPO_MAP}" \
-            --quiet
         env:
           PROJECT_ID: ${{ secrets.PROJECT_ID }}
           REGION: ${{ secrets.REGION }}
@@ -50,9 +37,18 @@ jobs:
           REPO_MAP: ${{ secrets.REPO_MAP }}
           BASIC_USER: ${{ secrets.BASIC_USER }}
           BASIC_PASS: ${{ secrets.BASIC_PASS }}
-          DEFAULT_REPO: ${{ secrets.DEFAULT_REPO }}
-          GH_PR_TOKEN: ${{ secrets.GH_PR_TOKEN }}
+          CODEX_HANDLE: ${{ vars.CODEX_HANDLE }}
           WINDOW_MIN: ${{ vars.WINDOW_MIN }}
           MAX_LINES: ${{ vars.MAX_LINES }}
           MAX_CHARS: ${{ vars.MAX_CHARS }}
-          CODEX_HANDLE: ${{ vars.CODEX_HANDLE }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gcloud config set project "${PROJECT_ID}"
+          REPO_MAP_ESCAPED="${REPO_MAP//,/\\,}"
+          gcloud run deploy "$SERVICE_NAME" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --source . \
+            --allow-unauthenticated \
+            --set-env-vars REGION="${REGION}",CLOUD_RUN_SERVICES="${SERVICES}",REPO_MAP_JSON="${REPO_MAP_ESCAPED}",CODEX_HANDLE="${CODEX_HANDLE}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",WEBHOOK_USER="${BASIC_USER}",WEBHOOK_PASS="${BASIC_PASS}",GITHUB_TOKEN="${GH_TOKEN}" \
+            --quiet

@@ -22,42 +22,45 @@ Cloud Monitoring alert  ──▶  Cloud Run bridge  ──▶  GitHub PR commen
 
 * A Google Cloud project with Cloud Run, Cloud Logging, and Cloud Monitoring enabled.
 * A service account with **Cloud Run Admin**, **Service Account User**, and **Logging Viewer** roles for deployment.
-* A GitHub personal access token (classic or fine-grained) with `repo` scope so the bridge can comment on pull requests.
+* A GitHub personal access token with permission to comment on pull requests in the target repository (store it in the repository secret `GH_TOKEN`).
 * A GitHub repository where you will host this code and run the CI/CD workflow.
 
 > ℹ️  The sample app reads Basic Auth credentials from environment variables `WEBHOOK_USER` / `WEBHOOK_PASS`. If you skip them the webhook is wide open, so it is best to set them.
 
-## 1. Configure GitHub secrets and variables
+## 1. Configure GitHub repository secrets and variables
 
-Create the following repository **secrets** (`Settings → Secrets and variables → Actions → New repository secret`). The deploy workflow forwards each secret to Cloud Run as shown below.
+### Repository secrets
+
+Create the following repository **secrets** (`Settings → Secrets and variables → Actions → New repository secret`). The deploy workflow forwards each secret to Cloud Run or to the deployment tooling as noted.
 
 | Secret | Used for | Cloud Run env var | Example |
 | --- | --- | --- | --- |
 | `PROJECT_ID` | gcloud deploy project | _n/a (deploy flag)_ | `my-gcp-project` |
 | `REGION` | Cloud Run region + log filters | `REGION` | `europe-north1` |
 | `SERVICES` | Comma-separated Cloud Run service names to inspect | `CLOUD_RUN_SERVICES` | `svc-a,svc-b` |
-| `REPO_MAP` | JSON object mapping service → GitHub repo | `REPO_MAP_JSON` | `{ "svc-a": "OWNER/REPO_A" }` |
-| `DEFAULT_REPO` | (Recommended) fallback repo if mapping misses | `DEFAULT_REPO` | `OWNER/REPO_FALLBACK` |
+| `REPO_MAP` | JSON mapping service → GitHub repo | `REPO_MAP_JSON` | `{ "svc-a": "OWNER/REPO_A" }` |
 | `BASIC_USER` | Webhook Basic Auth username | `WEBHOOK_USER` | `henrik` |
 | `BASIC_PASS` | Webhook Basic Auth password | `WEBHOOK_PASS` | `strong-generated-value` |
-| `GH_PR_TOKEN` | Long-lived PAT used by the bridge to comment | `GITHUB_TOKEN` | _GitHub PAT string_ |
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` **or** `GCP_SA_KEY` | GitHub → GCP authentication | _n/a (deploy step)_ | Workload Identity provider resource name or JSON key |
-| `GCP_SERVICE_ACCOUNT` (if using WIF) | Service account email for deployment | _n/a (deploy step)_ | `deploy-bot@my-gcp-project.iam.gserviceaccount.com` |
+| `GH_TOKEN` | GitHub PAT used for PR comments | `GITHUB_TOKEN` | `ghp_xxx` |
+| `GCP_SA_KEY` | Service account key (JSON) used by CI to authenticate | _n/a (auth step)_ | *(contents of the key file)* |
 
-Then add these repository **variables** (`Settings → Secrets and variables → Actions → New repository variable`). They control comment formatting and log selection and can be tuned without touching secrets:
+*Store `REPO_MAP` as compact JSON without spaces or newlines so it can be forwarded cleanly (e.g. `{"svc-a":"OWNER/REPO_A"}`).*
 
+### Repository variables
+
+Add the following repository **variables** (`Settings → Secrets and variables → Actions → New repository variable`). They control comment formatting and log selection and can be tuned without touching secrets:
 | Variable | Purpose | Default idea |
 | --- | --- | --- |
-| `CODEX_HANDLE` | Handle to mention in PR comments | `codex` |
-| `WINDOW_MIN` | Minutes before/after incident to query logs | `5` |
+| `CODEX_HANDLE` | Handle to mention in PR comments | `codex` 
+| `WINDOW_MIN` | Minutes before/after an incident to query logs | `5` |
 | `MAX_LINES` | Maximum total log lines captured | `40` |
 | `MAX_CHARS` | Maximum characters included in the comment | `20000` |
 
-### Notes on values
+### GitHub token for PR comments
 
-* `REPO_MAP` **must** be a valid JSON string. If you need multiple mappings, include them all: `{ "svc-a": "OWNER/REPO_A", "svc-b": "OWNER/REPO_B" }`.
-* Ensure every service in the alert is represented in `REPO_MAP`; otherwise also set `DEFAULT_REPO` so incidents never fail.
-* Store the GitHub PAT in `GH_PR_TOKEN`. It is long-lived and will be baked into the Cloud Run environment, so treat it with care.
+The bridge reads the GitHub PAT from the `GITHUB_TOKEN` environment variable. Add the token to the repository secret `GH_TOKEN`; the CI/CD workflow forwards it to Cloud Run each time it deploys the service.
+
+> Optional: If you also keep the PAT in Secret Manager for local or manual deployments, set `GITHUB_TOKEN` from that secret before running `gcloud run deploy`.
 
 ## 2. Build the log-based alert filter
 
@@ -93,19 +96,31 @@ Attach a **webhook notification channel**. You will point it at the Cloud Run UR
 
 ## 3. Deploy the bridge service
 
-### Manual deployment (one-off)
+### Manual deployment (optional)
 
-If you want to verify locally before wiring up CI, deploy with gcloud from this repo root:
+To verify the setup before wiring up CI, deploy once with `gcloud` from this repo root. Set the required values as environment variables before running the command (they should match the GitHub secrets/variables described above):
 
 ```bash
+export PROJECT_ID="my-gcp-project"
+export REGION="europe-north1"
+export SERVICES="svc-a,svc-b"
+export REPO_MAP_JSON='{"svc-a":"OWNER/REPO_A"}'
+export BASIC_USER="henrik"
+export BASIC_PASS="super-secret"
+export CODEX_HANDLE="codex"
+export WINDOW_MIN="5"
+export MAX_LINES="40"
+export MAX_CHARS="20000"
+export GITHUB_TOKEN="ghp_xxx"
+
+REPO_MAP_ESCAPED="${REPO_MAP_JSON//,/\\,}"
+
 gcloud run deploy log2pr-bridge \
   --source . \
-  --region "${REGION}" \
   --project "${PROJECT_ID}" \
+  --region "${REGION}" \
   --allow-unauthenticated \
-  --set-env-vars REGION="${REGION}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",CODEX_HANDLE="${CODEX_HANDLE}" \
-  --set-env-vars CLOUD_RUN_SERVICES="svc-a,svc-b",REPO_MAP_JSON='{"svc-a":"OWNER/REPO_A","svc-b":"OWNER/REPO_B"}',DEFAULT_REPO="OWNER/REPO_FALLBACK" \
-  --set-env-vars WEBHOOK_USER="${BASIC_USER}",WEBHOOK_PASS="${BASIC_PASS}",GITHUB_TOKEN="${GH_PR_TOKEN}"
+  --set-env-vars REGION="${REGION}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",CODEX_HANDLE="${CODEX_HANDLE}",CLOUD_RUN_SERVICES="${SERVICES}",REPO_MAP_JSON="${REPO_MAP_ESCAPED}",WEBHOOK_USER="${BASIC_USER}",WEBHOOK_PASS="${BASIC_PASS}",GITHUB_TOKEN="${GITHUB_TOKEN}"
 ```
 
 The service account running the container must have **Logging Viewer** access to read log entries.
@@ -114,13 +129,11 @@ The service account running the container must have **Logging Viewer** access to
 
 This repository ships with a workflow at `.github/workflows/deploy.yml`. It:
 
-1. authenticates to Google Cloud via Workload Identity Federation or a service account key,
+1. authenticates to Google Cloud using the `GCP_SA_KEY` repository secret,
 2. builds and deploys the service to Cloud Run whenever you push to `main`, and
-3. forwards the secrets and variables above into Cloud Run environment variables.
+3. forwards the secrets and variables above into Cloud Run environment variables, including the GitHub PAT from the `GH_TOKEN` repository secret.
 
-You can also trigger it manually from the **Actions** tab using "Run workflow".
-
-Make sure the authentication inputs are configured (either `GCP_WORKLOAD_IDENTITY_PROVIDER` + `GCP_SERVICE_ACCOUNT`, or `GCP_SA_KEY`). The workflow assumes the Cloud Run service is named `log2pr-bridge`; adjust the `SERVICE_NAME` env at the top of the file if you prefer a different name.
+You can also trigger it manually from the **Actions** tab using **Run workflow**. Ensure the service account JSON stored in `GCP_SA_KEY` belongs to the account that has the roles listed in the prerequisites.
 
 ## 4. Hook Monitoring to the bridge
 
@@ -128,7 +141,7 @@ After deployment grab the Cloud Run HTTPS URL and configure your Monitoring poli
 
 1. Monitoring → Alerting → Notification channels → Webhooks → **Add new**.
 2. Paste the Cloud Run URL.
-3. Enable Basic authentication and fill the username/password from `BASIC_USER`/`BASIC_PASS`.
+3. Enable Basic authentication and fill the username/password from `BASIC_USER` / `BASIC_PASS`.
 4. Save and test — you should receive a 200 OK from the bridge.
 
 Once the policy fires, the bridge will look up surrounding logs, map the affected service to a repo using `REPO_MAP_JSON`, and post a comment mentioning `@${CODEX_HANDLE}` on the latest updated pull request (open or closed).
@@ -136,8 +149,8 @@ Once the policy fires, the bridge will look up surrounding logs, map the affecte
 ## 5. Tuning and extensions
 
 * **Status whitelist:** modify the log filter to allow expected statuses (e.g., 401, 403, 409) or add latency constraints (e.g., `httpRequest.latency>="3s"`).
-* **Service → repo mapping:** keep `REPO_MAP` JSON updated whenever you add new Cloud Run services. Use `DEFAULT_REPO` as a safety net.
-* **Secrets vs environment variables:** for higher security you can mirror the GitHub secrets into Secret Manager (`gcloud secrets versions add ...`) and swap `--set-env-vars` for `--set-secrets` in the deploy command.
+* **Service → repo mapping:** keep `REPO_MAP` JSON updated whenever you add new Cloud Run services so incidents always resolve to a repository.
+* **Secrets vs environment variables:** for higher security you can mirror the GitHub secrets into Secret Manager and swap `--set-env-vars` for `--set-secrets` in the deploy command.
 * **No PR history:** GitHub's API cannot add comments if the repository has never had a pull request. Ensure at least one PR exists (even if closed) or extend the service to open a dedicated "codex inbox" PR.
 
 ## Local development
@@ -145,11 +158,17 @@ Once the policy fires, the bridge will look up surrounding logs, map the affecte
 You can run the bridge locally with Flask for quick iteration:
 
 ```bash
+# Provide values that mirror your deployment (same PAT as the GH_TOKEN secret)
+export PROJECT_ID="my-gcp-project"
+export REGION="europe-north1"
+export SERVICES="svc-a,svc-b"
+export GITHUB_TOKEN="ghp_xxx"
+
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export GOOGLE_CLOUD_PROJECT="${PROJECT_ID}" GITHUB_TOKEN="${GH_PR_TOKEN}" WEBHOOK_USER="${BASIC_USER}" WEBHOOK_PASS="${BASIC_PASS}" \
-       REGION="${REGION}" CLOUD_RUN_SERVICES="svc-a,svc-b" REPO_MAP_JSON='{"svc-a":"OWNER/REPO_A"}' DEFAULT_REPO="OWNER/REPO_FALLBACK"
+export GOOGLE_CLOUD_PROJECT="${PROJECT_ID}" GITHUB_TOKEN="${GITHUB_TOKEN}" WEBHOOK_USER="${BASIC_USER}" WEBHOOK_PASS="${BASIC_PASS}" \
+       REGION="${REGION}" CLOUD_RUN_SERVICES="${SERVICES}" REPO_MAP_JSON='{"svc-a":"OWNER/REPO_A"}'
 flask --app app run --debug
 ```
 
