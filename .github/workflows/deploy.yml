@@ -1,0 +1,54 @@
+name: Deploy Cloud Run bridge
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  SERVICE_NAME: log2pr-bridge
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.PROJECT_ID }}
+
+      - name: Deploy Cloud Run service
+        env:
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          REGION: ${{ secrets.REGION }}
+          SERVICES: ${{ secrets.SERVICES }}
+          REPO_MAP: ${{ secrets.REPO_MAP }}
+          BASIC_USER: ${{ secrets.BASIC_USER }}
+          BASIC_PASS: ${{ secrets.BASIC_PASS }}
+          CODEX_HANDLE: ${{ vars.CODEX_HANDLE }}
+          WINDOW_MIN: ${{ vars.WINDOW_MIN }}
+          MAX_LINES: ${{ vars.MAX_LINES }}
+          MAX_CHARS: ${{ vars.MAX_CHARS }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gcloud config set project "${PROJECT_ID}"
+          REPO_MAP_ESCAPED="${REPO_MAP//,/\\,}"
+          gcloud run deploy "$SERVICE_NAME" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --source . \
+            --allow-unauthenticated \
+            --set-env-vars REGION="${REGION}",CLOUD_RUN_SERVICES="${SERVICES}",REPO_MAP_JSON="${REPO_MAP_ESCAPED}",CODEX_HANDLE="${CODEX_HANDLE}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",WEBHOOK_USER="${BASIC_USER}",WEBHOOK_PASS="${BASIC_PASS}",GITHUB_TOKEN="${GH_TOKEN}" \
+            --quiet
