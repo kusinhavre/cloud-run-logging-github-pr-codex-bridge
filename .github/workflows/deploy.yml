@@ -56,7 +56,7 @@ jobs:
             --project "$PROJECT_ID" --region "$REGION" \
             --source . \
             --allow-unauthenticated \
-            --set-env-vars REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS" \
+            --set-env-vars GCP_PROJECT="$PROJECT_ID",REGION="$REGION",CODEX_HANDLE="$CODEX_HANDLE",WINDOW_MIN="$WINDOW_MIN",MAX_LINES="$MAX_LINES",MAX_CHARS="$MAX_CHARS" \
             --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest,WEBHOOK_USER=webhook-user:latest,WEBHOOK_PASS=webhook-pass:latest,GITHUB_TOKEN=github-token:latest \
             --quiet
         
