@@ -7,7 +7,7 @@ from google.cloud import logging_v2
 app = Flask(__name__)
 
 # ---- Config ----
-PROJECT_ID   = os.environ.get("GCP_PROJECT") or os.environ["GOOGLE_CLOUD_PROJECT"]
+PROJECT_ID   = os.environ.get("GCP_PROJECT", False) or os.environ.get("GOOGLE_CLOUD_PROJECT", False)
 REGION       = os.environ.get("REGION", "")
 SERVICES     = [s.strip() for s in os.environ.get("CLOUD_RUN_SERVICES", "").split(",") if s.strip()]
 REPO_MAP     = json.loads(os.environ.get("REPO_MAP_JSON", "{}"))  # {"svc-a":"owner/repo", ...}
