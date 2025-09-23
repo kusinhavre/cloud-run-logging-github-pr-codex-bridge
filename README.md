@@ -1,21 +1,53 @@
 # Cloud Run log-to-PR bridge
 
-This repository contains a tiny Cloud Run service that turns a single Google Cloud Monitoring alert into a GitHub pull request mention. When the alert fires, the bridge
+```
+╔═══════════════════════════════════════════════════════════════════╗
+║  🚨  Cloud Run alert fired                                         ║
+║  🔎  Bridge fetches requests, errors & stderr tail                 ║
+║  📨  Latest PR gets a ping with everything you need to triage      ║
+╚═══════════════════════════════════════════════════════════════════╝
+```
 
-1. receives the webhook payload, optionally guarded by HTTP Basic authentication,
-2. queries Cloud Logging for "weird" HTTP statuses and obvious application errors around the incident timestamp,
-3. maps the Cloud Run service to the owning GitHub repository,
-4. finds the most recently updated pull request (open or closed), and
-5. posts a compact log extract that pings `@codex` (configurable).
+**Turn Cloud Monitoring pings into action.** This Cloud Run service is a tiny concierge that watches for a single webhook alert and instantly drops a fully formatted GitHub PR comment for the humans on duty.
 
-The result is a reusable incident-notification pattern that needs only one Monitoring policy per project and works even when no PR is currently open.
+```
+┌────────────────────────── GitHub PR comment ───────────────────────────┐
+│ Paging @codex — unusual HTTP statuses or errors detected               │
+│ Window: 2024-03-18T12:00:00Z – 2024-03-18T12:05:00Z (±5m)              │
+│ Services seen: svc-a                                                   │
+│                                                                        │
+│ Right before trigger (stderr tail, 3m):                                │
+│ 01 2024-03-18T12:04:58Z ERROR svc=svc-a status=- method=- url=-        │
+│    Traceback (most recent call last):                                  │
+│    ...                                                                 │
+│                                                                        │
+│ Request anomalies:                                                     │
+│ 01 2024-03-18T12:05:01Z ERROR svc=svc-a status=500 method=GET url=/    │
+│    {"message":"boom"}                                                  │
+│                                                                        │
+│ Container errors (same trace if available):                            │
+│ _No logs in window._                                                   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+When the alert fires, the bridge:
+
+1. receives the Monitoring webhook (with optional HTTP Basic authentication),
+2. queries Cloud Logging for unusual HTTP responses and container errors around the incident timestamp,
+3. stitches in a pre-trigger stderr tail so you see what happened moments before,
+4. maps the affected Cloud Run service to its owning GitHub repository (with a configurable default), and
+5. posts a compact PR comment that pings `@codex` (or any handle you configure) and attaches the raw webhook payload for context.
+
+Every comment contains three focused log extracts—pre-trigger stderr/stdout, unusual HTTP requests, and container errors—so the on-call engineer lands directly on the evidence they need.
+
+The result is a reusable incident-notification pattern that needs only one Monitoring policy per project and still works even when no PR is currently open.
 
 ## How it fits together
 
 ```
 Cloud Monitoring alert  ──▶  Cloud Run bridge  ──▶  GitHub PR comment (@codex)
                    │                   │
-                   └── queries Cloud Logging for the surrounding errors ─┘
+                   └── queries Cloud Logging for requests, errors & tail ─┘
 ```
 
 ## Prerequisites
@@ -94,10 +126,14 @@ Replace `ci-deployer@…` with your GitHub Actions service account email and upd
 Add the following repository **variables** (`Settings → Secrets and variables → Actions → New repository variable`). They control comment formatting and log selection and can be tuned without touching secrets:
 | Variable | Purpose | Default idea |
 | --- | --- | --- |
-| `CODEX_HANDLE` | Handle to mention in PR comments | `codex` 
+| `CODEX_HANDLE` | Handle to mention in PR comments | `codex`
+| `DEFAULT_REPO` | Fallback `owner/repo` slug if no mapping matches | `OWNER/REPO`
 | `WINDOW_MIN` | Minutes before/after an incident to query logs | `5` |
+| `PRE_MIN` | Minutes of stderr/stdout tail to include before the trigger | `3` |
 | `MAX_LINES` | Maximum total log lines captured | `40` |
 | `MAX_CHARS` | Maximum characters included in the comment | `20000` |
+
+> ⚠️  Update `DEFAULT_REPO` (or provide complete mappings) so the bridge never falls back to the placeholder `owner/repo` slug.
 
 ### GitHub token for PR comments
 
@@ -113,15 +149,18 @@ Create a logs-based alerting policy in Cloud Monitoring that captures unusual HT
 (
   resource.type="cloud_run_revision"
   logName=~"projects/.*/logs/run.googleapis.com%2Frequests"
+  resource.labels.location="europe-north1"
   (resource.labels.service_name="SVC_A" OR resource.labels.service_name="SVC_B")
   NOT httpRequest.userAgent:"GoogleHC"
   NOT httpRequest.requestUrl:"/health"
   (
     httpRequest.status<200 OR
+    (httpRequest.status>206 AND httpRequest.status<300) OR
     (httpRequest.status>=300 AND httpRequest.status!=301 AND httpRequest.status!=302 AND httpRequest.status!=303
                                AND httpRequest.status!=304 AND httpRequest.status!=307 AND httpRequest.status!=308) OR
-    (httpRequest.status=404 ? false : false)
+    httpRequest.status>=400
   )
+  httpRequest.status!=404
 )
 OR
 (
@@ -147,7 +186,9 @@ To verify the setup before wiring up CI, deploy once with `gcloud` from this rep
 export PROJECT_ID="my-gcp-project"
 export REGION="europe-north1"
 export CODEX_HANDLE="codex"
+export DEFAULT_REPO="OWNER/REPO"
 export WINDOW_MIN="5"
+export PRE_MIN="3"
 export MAX_LINES="40"
 export MAX_CHARS="20000"
 ```
@@ -160,7 +201,7 @@ gcloud run deploy log2pr-bridge \
   --project "${PROJECT_ID}" \
   --region "${REGION}" \
   --allow-unauthenticated \
-  --set-env-vars REGION="${REGION}",WINDOW_MIN="${WINDOW_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",CODEX_HANDLE="${CODEX_HANDLE}" \
+  --set-env-vars REGION="${REGION}",WINDOW_MIN="${WINDOW_MIN}",PRE_MIN="${PRE_MIN}",MAX_LINES="${MAX_LINES}",MAX_CHARS="${MAX_CHARS}",CODEX_HANDLE="${CODEX_HANDLE}",DEFAULT_REPO="${DEFAULT_REPO}" \
   --set-secrets CLOUD_RUN_SERVICES=services:latest,REPO_MAP_JSON=repo-map:latest,WEBHOOK_USER=webhook-user:latest,WEBHOOK_PASS=webhook-pass:latest,GITHUB_TOKEN=github-token:latest
 ```
 
@@ -193,6 +234,7 @@ Once the policy fires, the bridge will look up surrounding logs, map the affecte
 * **Service → repo mapping:** keep the `repo-map` secret updated whenever you add new Cloud Run services so incidents always resolve to a repository.
 * **Secret rotation:** because the workflow deploys the `:latest` version of each secret, rotate credentials by adding a new secret version and re-running the deploy (or pushing to `main`).
 * **No PR history:** GitHub's API cannot add comments if the repository has never had a pull request. Ensure at least one PR exists (even if closed) or extend the service to open a dedicated "codex inbox" PR.
+* **Pre-trigger window:** tune `PRE_MIN` when you want a longer or shorter stderr/stdout tail before the incident fires.
 
 ## Local development
 
@@ -207,12 +249,15 @@ export REPO_MAP_JSON="$(gcloud secrets versions access latest --secret=repo-map)
 export WEBHOOK_USER="$(gcloud secrets versions access latest --secret=webhook-user)"
 export WEBHOOK_PASS="$(gcloud secrets versions access latest --secret=webhook-pass)"
 export GITHUB_TOKEN="$(gcloud secrets versions access latest --secret=github-token)"
+export DEFAULT_REPO="OWNER/REPO"
+export PRE_MIN="3"
 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export GOOGLE_CLOUD_PROJECT="${PROJECT_ID}" GITHUB_TOKEN="${GITHUB_TOKEN}" WEBHOOK_USER="${WEBHOOK_USER}" WEBHOOK_PASS="${WEBHOOK_PASS}" \
-       REGION="${REGION}" CLOUD_RUN_SERVICES="${SERVICES}" REPO_MAP_JSON="${REPO_MAP_JSON}"
+       REGION="${REGION}" CLOUD_RUN_SERVICES="${SERVICES}" REPO_MAP_JSON="${REPO_MAP_JSON}" \
+       DEFAULT_REPO="${DEFAULT_REPO}" PRE_MIN="${PRE_MIN}"
 flask --app app run --debug
 ```
 
