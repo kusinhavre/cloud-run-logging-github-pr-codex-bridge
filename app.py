@@ -25,7 +25,7 @@ PROJECT_ID   = _first_env_value("GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "PROJECT_
 REGION       = os.environ.get("REGION", "")
 SERVICES     = [s.strip() for s in os.environ.get("CLOUD_RUN_SERVICES", "").split(",") if s.strip()]
 REPO_MAP     = json.loads(os.environ.get("REPO_MAP_JSON", "{}"))  # {"svc-a":"owner/repo", ...}
-DEFAULT_REPO = os.environ.get("DEFAULT_REPO")  # fallback "owner/repo" if service not in REPO_MAP
+DEFAULT_REPO = os.environ.get("DEFAULT_REPO", "owner/repo")  # fallback "owner/repo" if service not in REPO_MAP
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]  # store in Secret Manager
 CODEX_HANDLE = os.environ.get("CODEX_HANDLE", "codex")  # mention target, e.g. "codex"
@@ -143,7 +143,10 @@ def _summarize_log_exception(exc, max_len=500):
     if len(message) > max_len:
         message = message[: max_len - 1] + "…"
     return message
-
+    
+def _ok(**kwargs):
+    # Always acknowledge to Monitoring; include context for debugging
+    return {"ok": True, **kwargs}, 200
 
 def try_fetch_logs(filter_text, start, end, page_size=100):
     try:
@@ -224,12 +227,22 @@ def alert():
     services_seen = [e["svc"] for e in (req_logs + err_logs) if e.get("svc")]
     repo_slug = choose_repo(services_seen)
     if not repo_slug:
-        abort(500, "No repo mapping (REPO_MAP_JSON/DEFAULT_REPO) matched the services in logs")
-
+        app.logger.warning("No repo mapping. services_seen=%s REPO_MAP=%s DEFAULT_REPO=%s",
+                           services_seen, list(REPO_MAP.keys()), DEFAULT_REPO)
+        return _ok(note="no_repo_mapping", services_seen=sorted(set(services_seen)))
+    
     owner, repo = repo_slug.split("/", 1)
-    pr = latest_pr_number(owner, repo)
+    
+    try:
+        pr = latest_pr_number(owner, repo)
+    except requests.HTTPError as e:
+        body = e.response.text[:2000] if getattr(e, "response", None) else ""
+        app.logger.error("GitHub latest_pr_number failed: %s body=%s", e, body)
+        return _ok(note="github_latest_pr_error", status=getattr(e.response, "status_code", None))
+    
     if not pr:
-        abort(500, f"No pull requests found in {repo_slug}; create one once so we can comment on it.")
+        app.logger.warning("No PRs found in %s", repo_slug)
+        return _ok(note="no_prs_found", repo=repo_slug)
 
     # Build comment
     header = f"Paging @{CODEX_HANDLE} — unusual HTTP statuses or errors detected"
@@ -253,7 +266,14 @@ def alert():
         f"<details><summary>Raw webhook payload</summary>\n\n```json\n{json.dumps(payload)[:6000]}\n```\n</details>"
     )
 
-    link = post_pr_comment(owner, repo, pr, body)
+    try:
+        link = post_pr_comment(owner, repo, pr, body)
+    except requests.HTTPError as e:
+        body = e.response.text[:2000] if getattr(e, "response", None) else ""
+        app.logger.error("GitHub comment failed: %s body=%s", e, body)
+        return _ok(note="github_comment_error",
+                   status=getattr(e.response, "status_code", None), repo=repo_slug, pr=pr)
+
     response = {"repo": repo_slug, "pr": pr, "comment_url": link}
     log_errors = {}
     if req_error:
