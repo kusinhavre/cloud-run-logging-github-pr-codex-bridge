@@ -43,8 +43,16 @@ BASIC_PASS   = _strip_secret(os.environ.get("WEBHOOK_PASS"))
 WINDOW_MIN   = int(os.environ.get("WINDOW_MIN", "5"))  # minutes around incident
 MAX_LINES    = int(os.environ.get("MAX_LINES", "40"))  # total lines to include
 MAX_CHARS    = int(os.environ.get("MAX_CHARS", "20000"))
+PRE_MIN = int(os.environ.get("PRE_MIN", "3"))  # minutes to include *before* trigger
+
 
 # ---- Helpers ----
+def svc_clause_for(names):
+    names = [s.strip() for s in (names or []) if s and s.strip()]
+    if not names:
+        return None
+    return " OR ".join([f'resource.labels.service_name="{s}"' for s in names])
+
 def _get(obj, name, default=None):
     """Attr-or-dict get."""
     if obj is None:
@@ -150,6 +158,23 @@ def fetch_logs(filter_text, start, end, page_size=100):
 
     return out
 
+def format_lines(lines, max_lines=30, max_chars=8000, chronological=False):
+    # list_entries returns DESC by default; flip to show the last lines *leading into* the trigger
+    if chronological:
+        lines = list(reversed(lines))[-max_lines:]
+    else:
+        lines = lines[:max_lines]
+
+    blob = "\n\n".join(
+        f'{i+1:02d} {e.get("ts","")} {e.get("sev","")} '
+        f'svc={e.get("svc") or "-"} status={e.get("status") or "-"} url={e.get("url") or "-"}\n'
+        f'{e.get("text","")}'
+        for i, e in enumerate(lines)
+    )
+    if len(blob) > max_chars:
+        blob = blob[:max_chars] + "\n…(truncated)…"
+    return "```\n" + blob + "\n```" if blob else "_No logs in window._"
+
 def extract_hints(payload):
     inc = payload.get("incident", {}) or {}
     labels = (inc.get("resource", {}) or {}).get("labels", {}) or {}
@@ -232,6 +257,20 @@ def filter_container_errors(trace=None, region=None, services=None):
              'OR jsonPayload.message:("error" OR "exception"))')
     if trace:
         f.append(f'trace="{trace}"')
+    return "\n".join(f)
+
+def filter_stderr_tail(region=None, services=None):
+    f = [
+        'resource.type="cloud_run_revision"',
+        'logName:"run.googleapis.com%2Fstderr"',
+        # stderr may not have severity set; match common error strings too
+        '(textPayload:"Traceback" OR textPayload:"Exception" OR textPayload:"CRITICAL" OR textPayload:"panic:" OR severity>=ERROR)',
+    ]
+    if region:
+        f.append(f'resource.labels.location="{region}"')
+    clause = svc_clause_for(services)
+    if clause:
+        f.append(f'({clause})')
     return "\n".join(f)
 
 def _summarize_log_exception(exc, max_len=500):
@@ -334,6 +373,32 @@ def alert():
         t0, t1
     )
 
+    # Build a union of candidate services: origin + watchlist + bridge itself
+    svc_union = set(s for s in (services_seen or []) if s)
+    if svc_hint:
+        svc_union.add(svc_hint)
+    for s in (SERVICES or []):
+        svc_union.add(s)
+    svc_union.add("log2pr-bridge")  # include crashes in the bridge itself
+    
+    # Time window: right *before* the trigger
+    pre_t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc)
+    pre_t0 = pre_t1 - timedelta(minutes=PRE_MIN)
+    
+    stderr_tail, stderr_err = try_fetch_logs(
+        filter_stderr_tail(region=region_hint or REGION, services=sorted(svc_union)),
+        pre_t0, pre_t1, page_size=50
+    )
+    
+    stderr_block = (
+        format_lines(
+            stderr_tail,
+            max_lines=min(30, MAX_LINES // 3),
+            max_chars=min(4000, MAX_CHARS // 3),
+            chronological=True,     # show the lead-in chronologically
+        ) if not stderr_err else f"_⚠️ Failed to load stderr tail: {stderr_err}_"
+    )
+
     # Build the set of candidate services
     services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
     if svc_hint:
@@ -375,7 +440,8 @@ def alert():
     body = (
         f"{header}\n\n"
         f"**Window:** `{t0.isoformat()} – {t1.isoformat()}` (±{WINDOW_MIN}m)\n"
-        f"**Services seen:** `{', '.join(sorted(set(s for s in services_seen if s)) or ['unknown'])}`\n\n"
+        f"**Services seen:** `{', '.join(services_seen) or 'unknown'}`\n\n"
+        f"**Right before trigger (stderr tail, {PRE_MIN}m):**\n{stderr_block}\n\n"
         f"**Request anomalies:**\n{req_block}\n\n"
         f"**Container errors (same trace if available):**\n{err_block}\n\n"
         f"<details><summary>Raw webhook payload</summary>\n\n```json\n{json.dumps(payload)[:6000]}\n```\n</details>"
