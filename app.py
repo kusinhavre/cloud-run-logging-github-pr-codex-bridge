@@ -75,25 +75,29 @@ def svc_clause():
     return " OR ".join([f'resource.labels.service_name="{s}"' for s in SERVICES])
 
 def filter_requests_weird():
-    f = [
+    parts = [
         'resource.type="cloud_run_revision"',
-        'logName=~"projects/.*/logs/run.googleapis.com%2Frequests"',
+        'logName:"run.googleapis.com%2Frequests"',
         'NOT httpRequest.userAgent:"GoogleHC"',
         'NOT httpRequest.requestUrl:"/health"',
     ]
-    if REGION:  f.append(f'resource.labels.location="{REGION}"')
-    if SERVICES: f.append(f'({svc_clause()})')
-    # not in {200,201,202,204,206,301,302,303,304,307,308,404}
-    f.append("""
-    (
-      httpRequest.status<200 OR
-      (httpRequest.status>=300 AND httpRequest.status!=301 AND httpRequest.status!=302 AND httpRequest.status!=303
-                                 AND httpRequest.status!=304 AND httpRequest.status!=307 AND httpRequest.status!=308) OR
-      (httpRequest.status>206 AND httpRequest.status<300) OR
-      (httpRequest.status=404 ? false : false)
+    if REGION:
+        parts.append(f'resource.labels.location="{REGION}"')
+    if SERVICES:
+        parts.append(f'({svc_clause()})')
+
+    # Flag anything not in: 200,201,202,204,206, 301,302,303,304,307,308, and we also ignore 404.
+    anomalies = (
+        '('
+        'httpRequest.status < 200 OR '
+        '(httpRequest.status > 206 AND httpRequest.status < 300) OR '
+        '(httpRequest.status >= 300 AND httpRequest.status != 301 AND httpRequest.status != 302 AND '
+        ' httpRequest.status != 303 AND httpRequest.status != 304 AND httpRequest.status != 307 AND httpRequest.status != 308) OR '
+        'httpRequest.status >= 400'
+        ') AND httpRequest.status != 404'
     )
-    """.strip())
-    return "\n".join(f)
+    parts.append(anomalies)
+    return "\n".join(parts)
 
 def filter_container_errors(trace=None):
     f = ['resource.type="cloud_run_revision"']
@@ -144,18 +148,12 @@ def _summarize_log_exception(exc, max_len=500):
 def try_fetch_logs(filter_text, start, end, page_size=100):
     try:
         return fetch_logs(filter_text, start, end, page_size=page_size), None
-    except (
-        gcloud_exceptions.GoogleAPICallError,
-        gcloud_exceptions.RetryError,
-        google_auth_exceptions.GoogleAuthError,
-        EnvironmentError,
-        ValueError,
-    ) as exc:
-        app.logger.exception("Cloud Logging query failed")
+    except (... as exc):
+        app.logger.error("Cloud Logging query failed: %s", _summarize_log_exception(exc))
+        app.logger.error("Filter used:\n%s\n", f'{filter_text}\n'
+                                               f'timestamp>="{start.isoformat()}" AND timestamp<="{end.isoformat()}"')
         return [], _summarize_log_exception(exc)
-    except Exception as exc:  # pragma: no cover - safety net for unexpected issues
-        app.logger.exception("Unexpected error while querying Cloud Logging")
-        return [], _summarize_log_exception(exc)
+
 
 def choose_repo(services_seen):
     # prefer an explicit mapping; otherwise default
