@@ -53,6 +53,12 @@ def svc_clause_for(names):
         return None
     return " OR ".join([f'resource.labels.service_name="{s}"' for s in names])
 
+def region_clause_for(regions):
+    regs = [r for r in (regions or []) if r]
+    if not regs:
+        return None
+    return "(" + " OR ".join([f'resource.labels.location="{r}"' for r in regs]) + ")"
+
 def _get(obj, name, default=None):
     """Attr-or-dict get."""
     if obj is None:
@@ -118,33 +124,36 @@ def fetch_logs(filter_text, start, end, page_size=100):
     out = []
     for e in entries:
         # timestamp
-        ts = _get(e, "timestamp")
-        if isinstance(ts, datetime):
-            ts_str = ts.isoformat()
-        else:
-            ts_str = str(ts) if ts else ""
+        ts = getattr(e, "timestamp", None)
+        ts_str = ts.isoformat() if isinstance(ts, datetime) else (str(ts) if ts else "")
 
         # severity
-        sev = _get(e, "severity")
-
-        # http request info (works for dicts or objects)
-        http = _get(e, "http_request")
+        sev = getattr(e, "severity", None)
+        # http request (object or dict with snake/camel)
+        http = getattr(e, "http_request", None)
         if isinstance(http, dict):
             status = http.get("status")
-            url    = http.get("request_url")
+            url    = http.get("request_url") or http.get("requestUrl") or http.get("url")
+            method = http.get("request_method") or http.get("requestMethod") or http.get("method")
         else:
             status = getattr(http, "status", None) if http else None
             url    = getattr(http, "request_url", None) if http else None
+            method = getattr(http, "request_method", None) if http else None
 
-        # resource.labels.service_name
-        labels = _get_nested(e, "resource", "labels") or {}
-        if not isinstance(labels, dict):
-            # Some object shapes expose .resource.labels as a dict-like already
-            labels = getattr(getattr(e, "resource", None), "labels", {}) or {}
+        # resource.labels.service_name (object or dict)
+        res = getattr(e, "resource", None)
+        labels = {}
+        if isinstance(res, dict):
+            labels = res.get("labels", {}) or {}
+        else:
+            labels = getattr(res, "labels", {}) or {}
         svc = labels.get("service_name")
 
-        # trace id (string or missing)
-        trace = _get(e, "trace")
+        # trace
+        trace = getattr(e, "trace", None)
+
+        # payload normalization
+        text = _payload_to_str(e)
 
         out.append({
             "ts": ts_str,
@@ -152,28 +161,27 @@ def fetch_logs(filter_text, start, end, page_size=100):
             "svc": svc,
             "trace": trace,
             "status": status,
+            "method": method,
             "url": url,
-            "text": _payload_to_str(e),
+            "text": text,
         })
-
     return out
 
-def format_lines(lines, max_lines=30, max_chars=8000, chronological=False):
-    # list_entries returns DESC by default; flip to show the last lines *leading into* the trigger
-    if chronological:
-        lines = list(reversed(lines))[-max_lines:]
-    else:
-        lines = lines[:max_lines]
 
+def format_lines(lines, max_lines=30, max_chars=8000, chronological=False):
+    entries = list(lines or [])
+    entries = list(reversed(entries))[-max_lines:] if chronological else entries[:max_lines]
     blob = "\n\n".join(
         f'{i+1:02d} {e.get("ts","")} {e.get("sev","")} '
-        f'svc={e.get("svc") or "-"} status={e.get("status") or "-"} url={e.get("url") or "-"}\n'
+        f'svc={e.get("svc") or "-"} status={e.get("status") or "-"} '
+        f'method={(e.get("method") or "-")} url={(e.get("url") or "-")}\n'
         f'{e.get("text","")}'
-        for i, e in enumerate(lines)
+        for i, e in enumerate(entries)
     )
     if len(blob) > max_chars:
         blob = blob[:max_chars] + "\n…(truncated)…"
-    return "```\n" + blob + "\n```" if blob else "_No logs in window._"
+    return f"```\n{blob}\n```" if blob else "_No logs in window._"
+
 
 def extract_hints(payload):
     inc = payload.get("incident", {}) or {}
@@ -259,19 +267,22 @@ def filter_container_errors(trace=None, region=None, services=None):
         f.append(f'trace="{trace}"')
     return "\n".join(f)
 
-def filter_stderr_tail(region=None, services=None):
+def filter_stderr_tail(regions=None, services=None, trace=None):
     f = [
         'resource.type="cloud_run_revision"',
         'logName:"run.googleapis.com%2Fstderr"',
-        # stderr may not have severity set; match common error strings too
         '(textPayload:"Traceback" OR textPayload:"Exception" OR textPayload:"CRITICAL" OR textPayload:"panic:" OR severity>=ERROR)',
     ]
-    if region:
-        f.append(f'resource.labels.location="{region}"')
-    clause = svc_clause_for(services)
-    if clause:
-        f.append(f'({clause})')
+    rc = region_clause_for(regions)
+    if rc:
+        f.append(rc)
+    sc = svc_clause_for(services)
+    if sc:
+        f.append(f"({sc})")
+    if trace:
+        f.append(f'trace="{trace}"')
     return "\n".join(f)
+
 
 def _summarize_log_exception(exc, max_len=500):
     message = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
@@ -370,30 +381,30 @@ def alert():
 
     services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
 
-    # --- now safe to build the union for the stderr tail ---
-    svc_union = set(services_seen)
-    if svc_hint:
-        svc_union.add(svc_hint)
-    if SERVICES:
-        svc_union.update(SERVICES)
+    # Build service union
+    svc_union = set(services_seen or [])
+    if svc_hint: svc_union.add(svc_hint)
+    if SERVICES: svc_union.update(SERVICES)
     k_service = os.environ.get("K_SERVICE")
-    if k_service:
-        svc_union.add(k_service)
-    svc_union.add("log2pr-bridge")  # include the bridge itself
-
-    pre_t0 = t1 - timedelta(minutes=PRE_MIN)
+    if k_service: svc_union.add(k_service)
+    svc_union.add("log2pr-bridge")
+    
+    # Regions to include in pre-trigger tail
+    regions = [region_hint or None, REGION or None]  # e.g., ["europe-north1", "us-west1"]
+    
+    # Use the same trace if we found one in request logs (helps correlate)
+    trace = next((e.get("trace") for e in req_logs if e.get("trace")), None)
+    
+    pre_t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc)
+    pre_t0 = pre_t1 - timedelta(minutes=PRE_MIN)
+    
     stderr_tail, stderr_err = try_fetch_logs(
-        filter_stderr_tail(region=region_hint or REGION, services=sorted(svc_union)),
-        pre_t0, t1, page_size=50
+        filter_stderr_tail(regions=regions, services=sorted(svc_union), trace=trace),
+        pre_t0, pre_t1, page_size=100
     )
-
     stderr_block = (
-        format_lines(
-            stderr_tail,
-            max_lines=min(30, MAX_LINES // 3),
-            max_chars=min(4000, MAX_CHARS // 3),
-            chronological=True,     # show the lead-in chronologically
-        ) if not stderr_err else f"_⚠️ Failed to load stderr tail: {stderr_err}_"
+        format_lines(stderr_tail, max_lines=min(40, MAX_LINES // 2), max_chars=min(6000, MAX_CHARS // 2), chronological=True)
+        if not stderr_err else f"_⚠️ Failed to load stderr tail: {stderr_err}_"
     )
 
     # Build the set of candidate services
