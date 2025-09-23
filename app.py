@@ -347,6 +347,7 @@ def format_lines(lines, max_lines=30, max_chars=8000):
         blob = blob[:max_chars] + "\n…(truncated)…"
     return "```\n" + blob + "\n```" if blob else "_No logs in window._"
 
+
 @app.post("/alert")
 def alert():
     if not check_basic_auth(request):
@@ -354,42 +355,48 @@ def alert():
 
     payload = request.get_json(silent=True) or {}
     inc = payload.get("incident", {}) or {}
+
+    started_at = int(inc.get("started_at") or time.time())
+    t1 = datetime.fromtimestamp(started_at, tz=timezone.utc)
+    t0 = t1 - timedelta(minutes=WINDOW_MIN)
+
     svc_hint, region_hint = extract_hints(payload)
 
-    started_at = inc.get("started_at") or int(time.time())
-    t0 = datetime.fromtimestamp(int(started_at), tz=timezone.utc) - timedelta(minutes=WINDOW_MIN)
-    t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc) + timedelta(minutes=WINDOW_MIN)
+    # --- ensure the name exists BEFORE any use ---
+    services_seen: list[str] = []
 
-    # Query logs using the hints (don’t rely solely on env REGION/SERVICES)
+    # main log pulls
     req_logs, req_error = try_fetch_logs(
         filter_requests_weird(region=region_hint or REGION,
                               services=[svc_hint] if svc_hint else SERVICES),
         t0, t1
     )
-    trace = next((e["trace"] for e in req_logs if e.get("trace")), None)
+    trace = next((e.get("trace") for e in req_logs if e.get("trace")), None)
     err_logs, err_error = try_fetch_logs(
         filter_container_errors(trace, region=region_hint or REGION,
                                 services=[svc_hint] if svc_hint else SERVICES),
         t0, t1
     )
 
-    # Build a union of candidate services: origin + watchlist + bridge itself
-    svc_union = set(s for s in (services_seen or []) if s)
+    services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
+
+    # --- now safe to build the union for the stderr tail ---
+    svc_union = set(services_seen)
     if svc_hint:
         svc_union.add(svc_hint)
-    for s in (SERVICES or []):
-        svc_union.add(s)
-    svc_union.add("log2pr-bridge")  # include crashes in the bridge itself
-    
-    # Time window: right *before* the trigger
-    pre_t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc)
-    pre_t0 = pre_t1 - timedelta(minutes=PRE_MIN)
-    
+    if SERVICES:
+        svc_union.update(SERVICES)
+    k_service = os.environ.get("K_SERVICE")
+    if k_service:
+        svc_union.add(k_service)
+    svc_union.add("log2pr-bridge")  # include the bridge itself
+
+    pre_t0 = t1 - timedelta(minutes=PRE_MIN)
     stderr_tail, stderr_err = try_fetch_logs(
         filter_stderr_tail(region=region_hint or REGION, services=sorted(svc_union)),
-        pre_t0, pre_t1, page_size=50
+        pre_t0, t1, page_size=50
     )
-    
+
     stderr_block = (
         format_lines(
             stderr_tail,
