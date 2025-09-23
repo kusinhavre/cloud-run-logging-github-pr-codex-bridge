@@ -2,6 +2,8 @@ import os, json, base64, time, hashlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
 import requests
+import base64, hmac
+from flask import Response
 from google.cloud import logging_v2
 from google.api_core import exceptions as gcloud_exceptions
 from google.auth import exceptions as google_auth_exceptions
@@ -42,19 +44,30 @@ MAX_LINES    = int(os.environ.get("MAX_LINES", "40"))  # total lines to include
 MAX_CHARS    = int(os.environ.get("MAX_CHARS", "20000"))
 
 # ---- Helpers ----
+def _challenge():
+    r = Response(status=401)
+    r.headers['WWW-Authenticate'] = 'Basic realm="gcm-webhook"'
+    return r
+
 def check_basic_auth(req):
+    # If no creds configured, allow through
     if not BASIC_USER or not BASIC_PASS:
         return True
-    auth = req.headers.get("Authorization")
-    if not auth or not auth.startswith("Basic "):
-        abort(401, www_authenticate='Basic realm="gcm-webhook"')
+
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return _challenge()
+
     try:
-        user, pwd = base64.b64decode(auth.split()[1]).decode().split(":", 1)
+        user, pwd = base64.b64decode(auth.split()[1]).decode("utf-8").split(":", 1)
     except Exception:
-        abort(401)
-    if user != BASIC_USER or pwd != BASIC_PASS:
-        abort(401)
+        return _challenge()
+
+    if not (hmac.compare_digest(user, BASIC_USER) and hmac.compare_digest(pwd, BASIC_PASS)):
+        return _challenge()
+
     return True
+
 
 def svc_clause():
     if not SERVICES:
