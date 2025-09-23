@@ -174,7 +174,7 @@ def format_lines(lines, max_lines=30, max_chars=8000, chronological=False):
     blob = "\n\n".join(
         f'{i+1:02d} {e.get("ts","")} {e.get("sev","")} '
         f'svc={e.get("svc") or "-"} status={e.get("status") or "-"} '
-        f'method={(e.get("method") or "-")} url={(e.get("url") or "-")}\n'
+        f'method={e.get("method") or "-"} url={e.get("url") or "-"}\n'
         f'{e.get("text","")}'
         for i, e in enumerate(entries)
     )
@@ -254,33 +254,38 @@ def filter_requests_weird(region=None, services=None):
     )
     return "\n".join(f)
 
-def filter_container_errors(trace=None, region=None, services=None):
+
+def filter_container_errors(region=None, services=None):
     f = ['resource.type="cloud_run_revision"']
     if region:
         f.append(f'resource.labels.location="{region}"')
     clause = svc_clause_for(services)
     if clause:
         f.append(f'({clause})')
+    # Exclude request logs; match stderr/stdout “error-looking” lines
+    f.append('NOT logName:"run.googleapis.com%2Frequests"')
+    f.append('(logName:"run.googleapis.com%2Fstderr" OR logName:"run.googleapis.com%2Fstdout")')
     f.append('(severity>=ERROR OR textPayload:("Traceback" OR "Exception" OR "CRITICAL" OR "panic:") '
-             'OR jsonPayload.message:("error" OR "exception"))')
-    if trace:
-        f.append(f'trace="{trace}"')
+             'OR jsonPayload.message:("error" OR "exception") OR jsonPayload.error:*)')
     return "\n".join(f)
 
-def filter_stderr_tail(regions=None, services=None, trace=None):
-    f = [
-        'resource.type="cloud_run_revision"',
-        'logName:"run.googleapis.com%2Fstderr"',
-        '(textPayload:"Traceback" OR textPayload:"Exception" OR textPayload:"CRITICAL" OR textPayload:"panic:" OR severity>=ERROR)',
-    ]
-    rc = region_clause_for(regions)
-    if rc:
-        f.append(rc)
-    sc = svc_clause_for(services)
-    if sc:
-        f.append(f"({sc})")
-    if trace:
-        f.append(f'trace="{trace}"')
+
+def filter_stderr_tail(regions=None, services=None, streams=("stderr", "stdout")):
+    f = ['resource.type="cloud_run_revision"']
+    if regions:
+        reg = "(" + " OR ".join([f'resource.labels.location="{r}"' for r in regions if r]) + ")"
+        if reg != "()": f.append(reg)
+    if services:
+        sc = svc_clause_for(services)
+        if sc: f.append(f"({sc})")
+    # streams
+    parts = []
+    if "stderr" in streams: parts.append('logName:"run.googleapis.com%2Fstderr"')
+    if "stdout" in streams: parts.append('logName:"run.googleapis.com%2Fstdout"')
+    if parts: f.append("(" + " OR ".join(parts) + ")")
+    # error-ish lines
+    f.append('(severity>=ERROR OR textPayload:("Traceback" OR "Exception" OR "CRITICAL" OR "panic:") '
+             'OR jsonPayload.message:("error" OR "exception") OR jsonPayload.error:*)')
     return "\n".join(f)
 
 
@@ -374,38 +379,55 @@ def alert():
     )
     trace = next((e.get("trace") for e in req_logs if e.get("trace")), None)
     err_logs, err_error = try_fetch_logs(
-        filter_container_errors(trace, region=region_hint or REGION,
+        filter_container_errors(region=region_hint or REGION,
                                 services=[svc_hint] if svc_hint else SERVICES),
-        t0, t1
+        t0, t1, page_size=200
     )
+    
 
     services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
 
-    # Build service union
+    # union services (origin + watchlist + bridge itself)
     svc_union = set(services_seen or [])
     if svc_hint: svc_union.add(svc_hint)
     if SERVICES: svc_union.update(SERVICES)
-    k_service = os.environ.get("K_SERVICE")
-    if k_service: svc_union.add(k_service)
+    svc_union.add(os.environ.get("K_SERVICE") or "")
     svc_union.add("log2pr-bridge")
+    svc_union = sorted(s for s in svc_union if s)
     
-    # Regions to include in pre-trigger tail
-    regions = [region_hint or None, REGION or None]  # e.g., ["europe-north1", "us-west1"]
+    # regions: origin and bridge region
+    regions = [region_hint or None, REGION or None]
     
-    # Use the same trace if we found one in request logs (helps correlate)
-    trace = next((e.get("trace") for e in req_logs if e.get("trace")), None)
-    
-    pre_t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc)
+    pre_t1 = datetime.fromtimestamp(started_at, tz=timezone.utc)
     pre_t0 = pre_t1 - timedelta(minutes=PRE_MIN)
     
+    # 1) stderr only
     stderr_tail, stderr_err = try_fetch_logs(
-        filter_stderr_tail(regions=regions, services=sorted(svc_union), trace=trace),
+        filter_stderr_tail(regions=regions, services=svc_union, streams=("stderr",)),
         pre_t0, pre_t1, page_size=100
     )
+    
+    # 2) if empty, add stdout too
+    if not stderr_tail and not stderr_err:
+        stderr_tail, stderr_err = try_fetch_logs(
+            filter_stderr_tail(regions=regions, services=svc_union, streams=("stderr", "stdout")),
+            pre_t0, pre_t1, page_size=150
+        )
+    
+    # 3) if still empty, widen window by +2 min
+    if not stderr_tail and not stderr_err:
+        wider_t0 = pre_t1 - timedelta(minutes=PRE_MIN + 2)
+        stderr_tail, stderr_err = try_fetch_logs(
+            filter_stderr_tail(regions=regions, services=svc_union, streams=("stderr", "stdout")),
+            wider_t0, pre_t1, page_size=200
+        )
+    
     stderr_block = (
-        format_lines(stderr_tail, max_lines=min(40, MAX_LINES // 2), max_chars=min(6000, MAX_CHARS // 2), chronological=True)
-        if not stderr_err else f"_⚠️ Failed to load stderr tail: {stderr_err}_"
+        format_lines(stderr_tail, max_lines=min(40, MAX_LINES // 2),
+                     max_chars=min(6000, MAX_CHARS // 2), chronological=True)
+        if not stderr_err else f"_⚠️ Failed to load stderr/stdout tail: {stderr_err}_"
     )
+    
 
     # Build the set of candidate services
     services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
