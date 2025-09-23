@@ -3,11 +3,23 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
 import requests
 from google.cloud import logging_v2
+from google.api_core import exceptions as gcloud_exceptions
+from google.auth import exceptions as google_auth_exceptions
 
 app = Flask(__name__)
 
 # ---- Config ----
-PROJECT_ID   = os.environ.get("GCP_PROJECT", False) or os.environ.get("GOOGLE_CLOUD_PROJECT", False)
+def _first_env_value(*names):
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            value = value.strip()
+            if value:
+                return value
+    return None
+
+
+PROJECT_ID   = _first_env_value("GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "PROJECT_ID")
 REGION       = os.environ.get("REGION", "")
 SERVICES     = [s.strip() for s in os.environ.get("CLOUD_RUN_SERVICES", "").split(",") if s.strip()]
 REPO_MAP     = json.loads(os.environ.get("REPO_MAP_JSON", "{}"))  # {"svc-a":"owner/repo", ...}
@@ -96,6 +108,35 @@ def fetch_logs(filter_text, start, end, page_size=100):
         })
     return out
 
+
+def _summarize_log_exception(exc, max_len=500):
+    message = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
+    message = " ".join(message.split())
+    if isinstance(exc, gcloud_exceptions.PermissionDenied):
+        message = f"{message} (check that the Cloud Run runtime service account has Logging Viewer access)"
+    elif isinstance(exc, google_auth_exceptions.DefaultCredentialsError):
+        message = f"{message} (application default credentials were not found)"
+    if len(message) > max_len:
+        message = message[: max_len - 1] + "…"
+    return message
+
+
+def try_fetch_logs(filter_text, start, end, page_size=100):
+    try:
+        return fetch_logs(filter_text, start, end, page_size=page_size), None
+    except (
+        gcloud_exceptions.GoogleAPICallError,
+        gcloud_exceptions.RetryError,
+        google_auth_exceptions.GoogleAuthError,
+        EnvironmentError,
+        ValueError,
+    ) as exc:
+        app.logger.exception("Cloud Logging query failed")
+        return [], _summarize_log_exception(exc)
+    except Exception as exc:  # pragma: no cover - safety net for unexpected issues
+        app.logger.exception("Unexpected error while querying Cloud Logging")
+        return [], _summarize_log_exception(exc)
+
 def choose_repo(services_seen):
     # prefer an explicit mapping; otherwise default
     for s in services_seen:
@@ -145,10 +186,10 @@ def alert():
     t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc) + timedelta(minutes=WINDOW_MIN)
 
     # Pull request logs with weird statuses
-    req_logs = fetch_logs(filter_requests_weird(), t0, t1)
+    req_logs, req_error = try_fetch_logs(filter_requests_weird(), t0, t1)
     # Try to pull container errors; if any request had a trace, focus on it
     trace = next((e["trace"] for e in req_logs if e.get("trace")), None)
-    err_logs = fetch_logs(filter_container_errors(trace), t0, t1)
+    err_logs, err_error = try_fetch_logs(filter_container_errors(trace), t0, t1)
 
     services_seen = [e["svc"] for e in (req_logs + err_logs) if e.get("svc")]
     repo_slug = choose_repo(services_seen)
@@ -162,8 +203,16 @@ def alert():
 
     # Build comment
     header = f"Paging @{CODEX_HANDLE} — unusual HTTP statuses or errors detected"
-    req_block = format_lines(req_logs, max_lines=MAX_LINES//2, max_chars=MAX_CHARS//2)
-    err_block = format_lines(err_logs, max_lines=MAX_LINES//2, max_chars=MAX_CHARS//2)
+    req_block = (
+        format_lines(req_logs, max_lines=MAX_LINES//2, max_chars=MAX_CHARS//2)
+        if not req_error
+        else f"_⚠️ Failed to load logs: {req_error}_"
+    )
+    err_block = (
+        format_lines(err_logs, max_lines=MAX_LINES//2, max_chars=MAX_CHARS//2)
+        if not err_error
+        else f"_⚠️ Failed to load logs: {err_error}_"
+    )
 
     body = (
         f"{header}\n\n"
@@ -175,4 +224,12 @@ def alert():
     )
 
     link = post_pr_comment(owner, repo, pr, body)
-    return {"repo": repo_slug, "pr": pr, "comment_url": link}, 200
+    response = {"repo": repo_slug, "pr": pr, "comment_url": link}
+    log_errors = {}
+    if req_error:
+        log_errors["requests"] = req_error
+    if err_error:
+        log_errors["container"] = err_error
+    if log_errors:
+        response["log_errors"] = log_errors
+    return response, 200
