@@ -462,7 +462,7 @@ def alert():
         else f"_⚠️ Failed to load logs: {req_error}_"
     )
     err_block = (
-        format_lines(err_logs, max_lines=MAX_LINES//2, max_chars=MAX_CHARS//2)
+        format_lines(err_logs, max_lines=MAX_LINES, max_chars=MAX_CHARS)
         if not err_error
         else f"_⚠️ Failed to load logs: {err_error}_"
     )
@@ -471,7 +471,7 @@ def alert():
         f"{header}\n\n"
         f"**Window:** `{t0.isoformat()} – {t1.isoformat()}` (±{WINDOW_MIN}m)\n"
         f"**Services seen:** `{', '.join(services_seen) or 'unknown'}`\n\n"
-        f"**Right before trigger (stderr tail, {PRE_MIN}m):**\n{stderr_block}\n\n"
+        # f"**Right before trigger (stderr tail, {PRE_MIN}m):**\n{stderr_block}\n\n"
         f"**Request anomalies:**\n{req_block}\n\n"
         f"**Container errors (same trace if available):**\n{err_block}\n\n"
         f"<details><summary>Raw webhook payload</summary>\n\n```json\n{json.dumps(payload)[:6000]}\n```\n</details>"
