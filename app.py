@@ -148,10 +148,22 @@ def _summarize_log_exception(exc, max_len=500):
 def try_fetch_logs(filter_text, start, end, page_size=100):
     try:
         return fetch_logs(filter_text, start, end, page_size=page_size), None
-    except (... as exc):
+    except (
+        gcloud_exceptions.GoogleAPICallError,
+        gcloud_exceptions.RetryError,
+        google_auth_exceptions.GoogleAuthError,
+        OSError,        # was EnvironmentError; OSError is the canonical alias
+        ValueError,
+    ) as exc:
         app.logger.error("Cloud Logging query failed: %s", _summarize_log_exception(exc))
-        app.logger.error("Filter used:\n%s\n", f'{filter_text}\n'
-                                               f'timestamp>="{start.isoformat()}" AND timestamp<="{end.isoformat()}"')
+        app.logger.error(
+            "Filter used:\n%s\n",
+            f'{filter_text}\n'
+            f'timestamp>="{start.isoformat()}" AND timestamp<="{end.isoformat()}"'
+        )
+        return [], _summarize_log_exception(exc)
+    except Exception as exc:  # last-resort safety net
+        app.logger.exception("Unexpected error while querying Cloud Logging")
         return [], _summarize_log_exception(exc)
 
 
