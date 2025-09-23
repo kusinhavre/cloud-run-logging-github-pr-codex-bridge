@@ -337,16 +337,6 @@ def post_pr_comment(owner, repo, pr_number, body):
     r.raise_for_status()
     return r.json().get("html_url")
 
-def format_lines(lines, max_lines=30, max_chars=8000):
-    lines = lines[:max_lines]
-    blob = "\n\n".join(
-        f'{i+1:02d} {e["ts"]} {e["sev"]} svc={e.get("svc")} status={e.get("status")} url={e.get("url")}\n{e["text"]}'
-        for i, e in enumerate(lines)
-    )
-    if len(blob) > max_chars:
-        blob = blob[:max_chars] + "\n…(truncated)…"
-    return "```\n" + blob + "\n```" if blob else "_No logs in window._"
-
 
 @app.post("/alert")
 def alert():
