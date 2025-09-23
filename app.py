@@ -45,6 +45,111 @@ MAX_LINES    = int(os.environ.get("MAX_LINES", "40"))  # total lines to include
 MAX_CHARS    = int(os.environ.get("MAX_CHARS", "20000"))
 
 # ---- Helpers ----
+def _get(obj, name, default=None):
+    """Attr-or-dict get."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+def _get_nested(obj, *names, default=None):
+    cur = obj
+    for n in names:
+        cur = _get(cur, n)
+        if cur is None:
+            return default
+    return cur
+
+def _payload_to_str(entry):
+    """Normalize payload (text/json/proto) to a short string."""
+    if isinstance(entry, dict):
+        if "textPayload" in entry:
+            return str(entry["textPayload"])[:2000]
+        if "jsonPayload" in entry:
+            try:
+                return json.dumps(entry["jsonPayload"])[:2000]
+            except Exception:
+                return str(entry["jsonPayload"])[:2000]
+        if "protoPayload" in entry:
+            try:
+                return json.dumps(entry["protoPayload"])[:2000]
+            except Exception:
+                return str(entry["protoPayload"])[:2000]
+        # Some dict-shaped entries put the merged content under 'payload'
+        if "payload" in entry:
+            p = entry["payload"]
+            if isinstance(p, str):
+                return p[:2000]
+            try:
+                return json.dumps(p)[:2000]
+            except Exception:
+                return str(p)[:2000]
+        return ""
+    # Object-shaped entries (google.cloud.logging_v2.entries.LogEntry)
+    payload = getattr(entry, "payload", None)
+    if isinstance(payload, str):
+        return payload[:2000]
+    if isinstance(payload, dict):
+        return (payload.get("message") or payload.get("msg")
+                or json.dumps(payload))[:2000]
+    return (str(payload)[:2000]) if payload is not None else ""
+
+# ---  fetch_logs ------------------------------------------------------
+def fetch_logs(filter_text, start, end, page_size=100):
+    client = logging_v2.Client(project=PROJECT_ID)
+    time_filter = f'timestamp>="{start.isoformat()}" AND timestamp<="{end.isoformat()}"'
+    final = f"{filter_text}\n{time_filter}"
+
+    entries = client.list_entries(
+        filter_=final,
+        order_by=logging_v2.DESCENDING,
+        page_size=page_size
+    )
+
+    out = []
+    for e in entries:
+        # timestamp
+        ts = _get(e, "timestamp")
+        if isinstance(ts, datetime):
+            ts_str = ts.isoformat()
+        else:
+            ts_str = str(ts) if ts else ""
+
+        # severity
+        sev = _get(e, "severity")
+
+        # http request info (works for dicts or objects)
+        http = _get(e, "http_request")
+        if isinstance(http, dict):
+            status = http.get("status")
+            url    = http.get("request_url")
+        else:
+            status = getattr(http, "status", None) if http else None
+            url    = getattr(http, "request_url", None) if http else None
+
+        # resource.labels.service_name
+        labels = _get_nested(e, "resource", "labels") or {}
+        if not isinstance(labels, dict):
+            # Some object shapes expose .resource.labels as a dict-like already
+            labels = getattr(getattr(e, "resource", None), "labels", {}) or {}
+        svc = labels.get("service_name")
+
+        # trace id (string or missing)
+        trace = _get(e, "trace")
+
+        out.append({
+            "ts": ts_str,
+            "sev": sev,
+            "svc": svc,
+            "trace": trace,
+            "status": status,
+            "url": url,
+            "text": _payload_to_str(e),
+        })
+
+    return out
+
 def extract_hints(payload):
     inc = payload.get("incident", {}) or {}
     labels = (inc.get("resource", {}) or {}).get("labels", {}) or {}
@@ -128,31 +233,6 @@ def filter_container_errors(trace=None, region=None, services=None):
     if trace:
         f.append(f'trace="{trace}"')
     return "\n".join(f)
-
-def fetch_logs(filter_text, start, end, page_size=100):
-    client = logging_v2.Client(project=PROJECT_ID)
-    time_filter = f'timestamp>="{start.isoformat()}" AND timestamp<="{end.isoformat()}"'
-    final = f"{filter_text}\n{time_filter}"
-    entries = client.list_entries(filter_=final, order_by=logging_v2.DESCENDING, page_size=page_size)
-    out = []
-    for e in entries:
-        # Support textPayload/jsonPayload; show minimal but useful fields
-        payload = e.payload if isinstance(e.payload, str) else (e.payload or {})
-        if isinstance(payload, dict):
-            payload = payload.get("message") or payload.get("msg") or json.dumps(payload)[:2000]
-        status = getattr(e, "http_request", None).status if getattr(e, "http_request", None) else None
-        url    = getattr(e, "http_request", None).request_url if getattr(e, "http_request", None) else None
-        out.append({
-            "ts": (e.timestamp.isoformat() if e.timestamp else ""),
-            "sev": e.severity,
-            "svc": e.resource.labels.get("service_name") if e.resource and e.resource.labels else None,
-            "trace": e.trace,
-            "status": status,
-            "url": url,
-            "text": str(payload)[:2000]
-        })
-    return out
-
 
 def _summarize_log_exception(exc, max_len=500):
     message = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
