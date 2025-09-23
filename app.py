@@ -27,8 +27,15 @@ DEFAULT_REPO = os.environ.get("DEFAULT_REPO")  # fallback "owner/repo" if servic
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]  # store in Secret Manager
 CODEX_HANDLE = os.environ.get("CODEX_HANDLE", "codex")  # mention target, e.g. "codex"
-BASIC_USER   = os.environ.get("WEBHOOK_USER")
-BASIC_PASS   = os.environ.get("WEBHOOK_PASS")
+def _strip_secret(value):
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+BASIC_USER   = _strip_secret(os.environ.get("WEBHOOK_USER"))
+BASIC_PASS   = _strip_secret(os.environ.get("WEBHOOK_PASS"))
 
 WINDOW_MIN   = int(os.environ.get("WINDOW_MIN", "5"))  # minutes around incident
 MAX_LINES    = int(os.environ.get("MAX_LINES", "40"))  # total lines to include
@@ -36,7 +43,7 @@ MAX_CHARS    = int(os.environ.get("MAX_CHARS", "20000"))
 
 # ---- Helpers ----
 def check_basic_auth(req):
-    if not BASIC_USER and not BASIC_PASS:
+    if not BASIC_USER or not BASIC_PASS:
         return True
     auth = req.headers.get("Authorization")
     if not auth or not auth.startswith("Basic "):
