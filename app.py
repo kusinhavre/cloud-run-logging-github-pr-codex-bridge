@@ -2,6 +2,7 @@ import os, json, base64, time, hashlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
 import requests
+import re
 import base64, hmac
 from flask import Response
 from google.cloud import logging_v2
@@ -44,6 +45,23 @@ MAX_LINES    = int(os.environ.get("MAX_LINES", "40"))  # total lines to include
 MAX_CHARS    = int(os.environ.get("MAX_CHARS", "20000"))
 
 # ---- Helpers ----
+def extract_hints(payload):
+    inc = payload.get("incident", {}) or {}
+    labels = (inc.get("resource", {}) or {}).get("labels", {}) or {}
+
+    svc_hint = labels.get("service_name")
+    region_hint = labels.get("location")
+
+    # Fallback: parse from resource_name like
+    # projects/.../locations/us-west1/services/weather-db/revisions/...
+    rn = inc.get("resource_name") or ""
+    m = re.search(r"/locations/([^/]+)/services/([^/]+)/", rn)
+    if m:
+        region_hint = region_hint or m.group(1)
+        svc_hint = svc_hint or m.group(2)
+
+    return svc_hint, region_hint
+
 def _challenge():
     r = Response(status=401)
     r.headers['WWW-Authenticate'] = 'Basic realm="gcm-webhook"'
@@ -68,42 +86,45 @@ def check_basic_auth(req):
 
     return True
 
-
-def svc_clause():
-    if not SERVICES:
+def svc_clause_for(names):
+    names = [s.strip() for s in (names or []) if s and s.strip()]
+    if not names:
         return None
-    return " OR ".join([f'resource.labels.service_name="{s}"' for s in SERVICES])
+    return " OR ".join([f'resource.labels.service_name="{s}"' for s in names])
 
-def filter_requests_weird():
-    parts = [
+def filter_requests_weird(region=None, services=None):
+    f = [
         'resource.type="cloud_run_revision"',
         'logName:"run.googleapis.com%2Frequests"',
         'NOT httpRequest.userAgent:"GoogleHC"',
         'NOT httpRequest.requestUrl:"/health"',
     ]
-    if REGION:
-        parts.append(f'resource.labels.location="{REGION}"')
-    if SERVICES:
-        parts.append(f'({svc_clause()})')
-
-    # Flag anything not in: 200,201,202,204,206, 301,302,303,304,307,308, and we also ignore 404.
-    anomalies = (
+    if region:
+        f.append(f'resource.labels.location="{region}"')
+    clause = svc_clause_for(services)
+    if clause:
+        f.append(f'({clause})')
+    f.append(
         '('
         'httpRequest.status < 200 OR '
         '(httpRequest.status > 206 AND httpRequest.status < 300) OR '
-        '(httpRequest.status >= 300 AND httpRequest.status != 301 AND httpRequest.status != 302 AND '
-        ' httpRequest.status != 303 AND httpRequest.status != 304 AND httpRequest.status != 307 AND httpRequest.status != 308) OR '
+        '(httpRequest.status >= 300 AND httpRequest.status != 301 AND '
+        ' httpRequest.status != 302 AND httpRequest.status != 303 AND '
+        ' httpRequest.status != 304 AND httpRequest.status != 307 AND httpRequest.status != 308) OR '
         'httpRequest.status >= 400'
         ') AND httpRequest.status != 404'
     )
-    parts.append(anomalies)
-    return "\n".join(parts)
+    return "\n".join(f)
 
-def filter_container_errors(trace=None):
+def filter_container_errors(trace=None, region=None, services=None):
     f = ['resource.type="cloud_run_revision"']
-    if REGION:  f.append(f'resource.labels.location="{REGION}"')
-    if SERVICES: f.append(f'({svc_clause()})')
-    f.append('(severity>=ERROR OR textPayload:("Traceback" OR "Exception" OR "CRITICAL" OR "panic:") OR jsonPayload.message:("error" OR "exception"))')
+    if region:
+        f.append(f'resource.labels.location="{region}"')
+    clause = svc_clause_for(services)
+    if clause:
+        f.append(f'({clause})')
+    f.append('(severity>=ERROR OR textPayload:("Traceback" OR "Exception" OR "CRITICAL" OR "panic:") '
+             'OR jsonPayload.message:("error" OR "exception"))')
     if trace:
         f.append(f'trace="{trace}"')
     return "\n".join(f)
@@ -210,26 +231,40 @@ def format_lines(lines, max_lines=30, max_chars=8000):
 @app.post("/alert")
 def alert():
     if not check_basic_auth(request):
-        abort(401)
+        return ("", 401)
 
     payload = request.get_json(silent=True) or {}
-    inc = payload.get("incident", {})
+    inc = payload.get("incident", {}) or {}
+    svc_hint, region_hint = extract_hints(payload)
+
     started_at = inc.get("started_at") or int(time.time())
     t0 = datetime.fromtimestamp(int(started_at), tz=timezone.utc) - timedelta(minutes=WINDOW_MIN)
     t1 = datetime.fromtimestamp(int(started_at), tz=timezone.utc) + timedelta(minutes=WINDOW_MIN)
 
-    # Pull request logs with weird statuses
-    req_logs, req_error = try_fetch_logs(filter_requests_weird(), t0, t1)
-    # Try to pull container errors; if any request had a trace, focus on it
+    # Query logs using the hints (don’t rely solely on env REGION/SERVICES)
+    req_logs, req_error = try_fetch_logs(
+        filter_requests_weird(region=region_hint or REGION,
+                              services=[svc_hint] if svc_hint else SERVICES),
+        t0, t1
+    )
     trace = next((e["trace"] for e in req_logs if e.get("trace")), None)
-    err_logs, err_error = try_fetch_logs(filter_container_errors(trace), t0, t1)
+    err_logs, err_error = try_fetch_logs(
+        filter_container_errors(trace, region=region_hint or REGION,
+                                services=[svc_hint] if svc_hint else SERVICES),
+        t0, t1
+    )
 
-    services_seen = [e["svc"] for e in (req_logs + err_logs) if e.get("svc")]
+    # Build the set of candidate services
+    services_seen = sorted({e.get("svc") for e in (req_logs + err_logs) if e.get("svc")})
+    if svc_hint:
+        services_seen = sorted(set(services_seen + [svc_hint]))
+
+    # Now map to repo
     repo_slug = choose_repo(services_seen)
-    if not repo_slug:
-        app.logger.warning("No repo mapping. services_seen=%s REPO_MAP=%s DEFAULT_REPO=%s",
-                           services_seen, list(REPO_MAP.keys()), DEFAULT_REPO)
-        return _ok(note="no_repo_mapping", services_seen=sorted(set(services_seen)))
+    if not repo_slug or "/" not in repo_slug or repo_slug.lower() in {"owner/repo", "org/repo"}:
+        app.logger.error("Invalid/missing repo mapping. services_seen=%s REPO_MAP=%s DEFAULT_REPO=%r",
+                         services_seen, list(REPO_MAP.keys()), DEFAULT_REPO)
+        return {"ok": True, "note": "bad_repo_slug", "services_seen": services_seen}, 200
     
     owner, repo = repo_slug.split("/", 1)
     
